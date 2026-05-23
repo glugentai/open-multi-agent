@@ -38,6 +38,39 @@ function createMockAdapter(responses: string[]): LLMAdapter {
   }
 }
 
+function textResponse(text: string): LLMResponse {
+  return {
+    id: `resp-${text.slice(0, 8)}`,
+    content: [{ type: 'text', text }],
+    model: 'mock-model',
+    stop_reason: 'end_turn',
+    usage: { input_tokens: 10, output_tokens: 20 },
+  }
+}
+
+function toolUseResponse(toolName: string, input: Record<string, unknown>): LLMResponse {
+  return {
+    id: `resp-tool-${toolName}`,
+    content: [{
+      type: 'tool_use',
+      id: `tool-${toolName}`,
+      name: toolName,
+      input,
+    }],
+    model: 'mock-model',
+    stop_reason: 'tool_use',
+    usage: { input_tokens: 10, output_tokens: 20 },
+  }
+}
+
+function extractUserPrompt(messages: LLMMessage[]): string {
+  const lastUser = [...messages].reverse().find((m) => m.role === 'user')
+  return (lastUser?.content ?? [])
+    .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+    .map((b) => b.text)
+    .join('\n')
+}
+
 /**
  * Mock the createAdapter factory to return our mock adapter.
  * We need to do this at the module level because Agent calls createAdapter internally.
@@ -526,6 +559,122 @@ describe('OpenMultiAgent', () => {
       const coordinatorToolNames = capturedChatOptions[0]?.tools?.map((t) => t.name) ?? []
       expect(coordinatorToolNames).toContain('file_read')
       expect(coordinatorToolNames).not.toContain('bash')
+    })
+
+    it('omits team-context block by default (revealCoordinator unset)', async () => {
+      mockAdapterResponses = [
+        '```json\n[{"title": "Research", "description": "Research the topic", "assignee": "worker-a"}]\n```',
+        'worker output',
+        'final synthesis',
+      ]
+
+      const oma = new OpenMultiAgent({ defaultModel: 'mock-model' })
+      const team = oma.createTeam('t', teamCfg())
+
+      await oma.runTeam(team, 'First research the topic, then synthesize findings')
+
+      // None of the captured prompts (coordinator decompose, worker run, coordinator synthesis)
+      // should contain the team-context header when the option is unset.
+      for (const prompt of capturedPrompts) {
+        expect(prompt).not.toContain('## Team context')
+      }
+    })
+
+    it('injects team-context block when revealCoordinator is true', async () => {
+      mockAdapterResponses = [
+        '```json\n[{"title": "Research", "description": "Research the topic", "assignee": "worker-a"}]\n```',
+        'worker output',
+        'final synthesis',
+      ]
+
+      const oma = new OpenMultiAgent({ defaultModel: 'mock-model' })
+      const team = oma.createTeam('t', teamCfg())
+
+      const goal = 'First research the topic, then synthesize findings'
+      await oma.runTeam(team, goal, { revealCoordinator: true })
+
+      // The worker prompt (second captured prompt) should contain the full context block.
+      // capturedPrompts[0] = coordinator decomposition, [1] = worker run, [2] = coordinator synthesis.
+      const workerPrompt = capturedPrompts[1] ?? ''
+      expect(workerPrompt).toContain('## Team context')
+      expect(workerPrompt).toContain(`Goal: ${goal}`)
+      expect(workerPrompt).toContain('Team: worker-a, worker-b')
+      expect(workerPrompt).toContain('Your role in this team: worker-a')
+      expect(workerPrompt).toContain('Assignment: You are responsible')
+      expect(workerPrompt).not.toContain('Coordinator: selected you')
+      // Defensive: the original task block must still be present after the context block.
+      expect(workerPrompt).toContain('# Task: Research')
+
+      // Defensive: coordinator's own prompts (decompose + synthesis) must NOT carry the
+      // team-context block — they don't go through buildTaskPrompt today, and we want
+      // a future refactor that changes that to break this test.
+      expect(capturedPrompts[0]).not.toContain('## Team context')
+      expect(capturedPrompts[2]).not.toContain('## Team context')
+    })
+
+    it('injects team-context block into delegated worker prompts when revealCoordinator is true', async () => {
+      const goal = 'First coordinate worker-a, then have worker-a delegate details to worker-b'
+      const delegatedPrompts: string[] = []
+      let coordinatorCalls = 0
+      let workerACalls = 0
+
+      const coordinatorAdapter: LLMAdapter = {
+        name: 'coordinator-mock',
+        async chat(): Promise<LLMResponse> {
+          coordinatorCalls++
+          return coordinatorCalls === 1
+            ? textResponse('```json\n[{"title": "Delegate detail", "description": "Ask worker-b for details", "assignee": "worker-a"}]\n```')
+            : textResponse('final synthesis')
+        },
+        async *stream() { yield { type: 'done' as const, data: {} } },
+      }
+      const workerAAdapter: LLMAdapter = {
+        name: 'worker-a-mock',
+        async chat(): Promise<LLMResponse> {
+          workerACalls++
+          return workerACalls === 1
+            ? toolUseResponse('delegate_to_agent', {
+                target_agent: 'worker-b',
+                prompt: 'Inspect delegated detail',
+              })
+            : textResponse('worker-a done')
+        },
+        async *stream() { yield { type: 'done' as const, data: {} } },
+      }
+      const workerBAdapter: LLMAdapter = {
+        name: 'worker-b-mock',
+        async chat(messages: LLMMessage[]): Promise<LLMResponse> {
+          delegatedPrompts.push(extractUserPrompt(messages))
+          return textResponse('worker-b delegated done')
+        },
+        async *stream() { yield { type: 'done' as const, data: {} } },
+      }
+
+      const oma = new OpenMultiAgent({ defaultModel: 'mock-model', maxConcurrency: 3 })
+      const team = oma.createTeam('t', teamCfg([
+        {
+          ...agentConfig('worker-a'),
+          adapter: workerAAdapter,
+          tools: ['delegate_to_agent'],
+          maxTurns: 3,
+        },
+        { ...agentConfig('worker-b'), adapter: workerBAdapter },
+      ]))
+
+      await oma.runTeam(team, goal, {
+        coordinator: { adapter: coordinatorAdapter },
+        revealCoordinator: true,
+      })
+
+      expect(delegatedPrompts).toHaveLength(1)
+      const delegatedPrompt = delegatedPrompts[0] ?? ''
+      expect(delegatedPrompt).toContain('## Team context')
+      expect(delegatedPrompt).toContain(`Goal: ${goal}`)
+      expect(delegatedPrompt).toContain('Team: worker-a, worker-b')
+      expect(delegatedPrompt).toContain('Your role in this team: worker-b')
+      expect(delegatedPrompt).toContain('Assignment: You are responsible')
+      expect(delegatedPrompt).toContain('Inspect delegated detail')
+      expect(delegatedPrompt).not.toContain('Coordinator: selected you')
     })
   })
 
