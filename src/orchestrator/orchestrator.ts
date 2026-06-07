@@ -48,11 +48,15 @@ import type {
   ConsensusResult,
   ConsensusVerifyOptions,
   CoordinatorConfig,
-  RunTeamOptions,
+  ModelRouteConfig,
+  ModelRoutingPolicy,
   PlanArtifact,
   PlanTaskArtifact,
   OrchestratorConfig,
   OrchestratorEvent,
+  RunTasksOptions,
+  RunTeamOptions,
+  StreamEvent,
   Task,
   TaskExecutionMetrics,
   TaskExecutionRecord,
@@ -353,6 +357,8 @@ interface ParsedTaskSpec {
   maxRetries?: number
   retryDelayMs?: number
   retryBackoff?: number
+  role?: string
+  priority?: 'low' | 'normal' | 'high' | 'critical'
   verify?: ConsensusVerifyOptions
 }
 
@@ -396,6 +402,10 @@ function parseTaskSpecs(raw: string): ParsedTaskSpec[] | null {
         maxRetries: typeof obj['maxRetries'] === 'number' ? obj['maxRetries'] : undefined,
         retryDelayMs: typeof obj['retryDelayMs'] === 'number' ? obj['retryDelayMs'] : undefined,
         retryBackoff: typeof obj['retryBackoff'] === 'number' ? obj['retryBackoff'] : undefined,
+        role: typeof obj['role'] === 'string' ? obj['role'] : undefined,
+        priority: obj['priority'] === 'low' || obj['priority'] === 'normal' || obj['priority'] === 'high' || obj['priority'] === 'critical'
+          ? obj['priority']
+          : undefined,
       })
     }
 
@@ -403,6 +413,51 @@ function parseTaskSpecs(raw: string): ParsedTaskSpec[] | null {
   } catch {
     return null
   }
+}
+
+interface ModelRoutingSelection {
+  readonly phase: 'coordinator' | 'synthesis' | 'short-circuit' | 'worker' | 'delegated'
+  readonly agent: string
+  readonly task?: Task
+  readonly leaf?: boolean
+}
+
+function routeMatches(
+  policy: ModelRoutingPolicy | undefined,
+  selection: ModelRoutingSelection,
+): ModelRouteConfig | undefined {
+  if (!policy) return undefined
+  const task = selection.task
+  for (const rule of policy.rules) {
+    const match = rule.match
+    if (match.phase !== undefined && match.phase !== selection.phase) continue
+    if (match.agent !== undefined && match.agent !== selection.agent) continue
+    if (match.taskRole !== undefined && match.taskRole !== task?.role) continue
+    if (match.taskPriority !== undefined && match.taskPriority !== task?.priority) continue
+    if (match.leaf !== undefined && match.leaf !== selection.leaf) continue
+    if (match.hasDependencies !== undefined && match.hasDependencies !== ((task?.dependsOn?.length ?? 0) > 0)) continue
+    return rule.route
+  }
+  return undefined
+}
+
+function withModelRoute(config: AgentConfig, route: ModelRouteConfig | undefined): AgentConfig {
+  if (!route) return config
+  return {
+    ...config,
+    model: route.model,
+    provider: route.provider ?? config.provider,
+    baseURL: route.baseURL ?? config.baseURL,
+    apiKey: route.apiKey ?? config.apiKey,
+    region: route.region ?? config.region,
+  }
+}
+
+function isLeafTask(task: Task, tasks: readonly Task[]): boolean {
+  for (const candidate of tasks) {
+    if (candidate.dependsOn?.includes(task.id)) return false
+  }
+  return true
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +520,9 @@ interface RunContext {
    * `runTasks` omits this entirely (no goal concept).
    */
   readonly revealCoordinatorContext?: RevealCoordinatorContext
+  readonly modelRouting?: ModelRoutingPolicy
+  readonly taskById: ReadonlyMap<string, Task>
+  readonly taskLeafById: ReadonlyMap<string, boolean>
 }
 
 /**
@@ -516,13 +574,19 @@ function buildTaskAgentTeamInfo(
 
     // Apply orchestrator-level defaults just like buildPool, then construct a
     // one-shot Agent for this delegation only.
-    const effective: AgentConfig = {
+    const route = routeMatches(ctx.modelRouting, {
+      phase: 'delegated',
+      agent: targetAgent,
+      task: ctx.taskById.get(taskId),
+      leaf: ctx.taskLeafById.get(taskId),
+    })
+    const effective: AgentConfig = withModelRoute({
       ...targetConfig,
       provider: targetConfig.provider ?? ctx.config.defaultProvider,
       baseURL: targetConfig.baseURL ?? ctx.config.defaultBaseURL,
       apiKey: targetConfig.apiKey ?? ctx.config.defaultApiKey,
       cwd: targetConfig.cwd === undefined ? ctx.config.defaultCwd : targetConfig.cwd,
-    }
+    }, route)
     const tempAgent = buildAgent(effective, { includeDelegateTool: true })
 
     const nestedTeam = buildTaskAgentTeamInfo(
@@ -625,6 +689,19 @@ async function executeQueue(
         return
       }
 
+      const agentConfig = team.getAgent(assignee)
+      if (!agentConfig) {
+        const msg = `Agent "${assignee}" not found in team for task "${task.title}".`
+        queue.fail(task.id, msg)
+        config.onProgress?.({
+          type: 'error',
+          task: task.id,
+          agent: assignee,
+          data: msg,
+        } satisfies OrchestratorEvent)
+        return
+      }
+
       const agent = pool.get(assignee)
       if (!agent) {
         const msg = `Agent "${assignee}" not found in pool for task "${task.title}".`
@@ -671,34 +748,57 @@ async function executeQueue(
         ...traceBase,
         team: buildTaskAgentTeamInfo(ctx, task.id, traceBase, 0, [assignee]),
       }
+      const workerRoute = routeMatches(ctx.modelRouting, {
+        phase: 'worker',
+        agent: assignee,
+        task,
+        leaf: ctx.taskLeafById.get(task.id),
+      })
+      const routedAgent = workerRoute
+        ? buildAgent(withModelRoute({
+            ...agentConfig,
+            provider: agentConfig.provider ?? config.defaultProvider,
+            baseURL: agentConfig.baseURL ?? config.defaultBaseURL,
+            apiKey: agentConfig.apiKey ?? config.defaultApiKey,
+            cwd: agentConfig.cwd === undefined ? config.defaultCwd : agentConfig.cwd,
+          }, workerRoute), { includeDelegateTool: true })
+        : undefined
+      const streamCallback = config.onAgentStream
+        ? (event: StreamEvent) => {
+            if (config.onTrace) {
+              const streamMs = Date.now()
+              emitTrace(config.onTrace, {
+                type: 'agent_stream',
+                runId: ctx.runId ?? '',
+                taskId: task.id,
+                agent: assignee,
+                streamType: event.type,
+                startMs: streamMs,
+                endMs: streamMs,
+                durationMs: 0,
+              })
+            }
+            config.onAgentStream!(assignee, event)
+          }
+        : undefined
 
       const taskStartMs = Date.now()
       let retryCount = 0
 
       const result = await executeWithRetry(
-        () => pool.run(
-          assignee,
-          prompt,
-          runOptions,
-          config.onAgentStream
-            ? (event) => {
-                if (config.onTrace) {
-                  const streamMs = Date.now()
-                  emitTrace(config.onTrace, {
-                    type: 'agent_stream',
-                    runId: ctx.runId ?? '',
-                    taskId: task.id,
-                    agent: assignee,
-                    streamType: event.type,
-                    startMs: streamMs,
-                    endMs: streamMs,
-                    durationMs: 0,
-                  })
-                }
-                config.onAgentStream!(assignee, event)
-              }
-            : undefined,
-        ),
+        () => routedAgent
+          ? pool.runEphemeral(
+              routedAgent,
+              prompt,
+              runOptions,
+              streamCallback,
+            )
+          : pool.run(
+              assignee,
+              prompt,
+              runOptions,
+              streamCallback,
+            ),
         task,
         (retryData) => {
           retryCount++
@@ -1435,14 +1535,14 @@ export class OpenMultiAgent {
       // to avoid duplicate progress events and double completedTaskCount.
       // Events are emitted here; counting is handled by buildTeamRunResult().
       const effectiveBudget = resolveTokenBudget(bestAgent.maxTokenBudget, this.config.maxTokenBudget)
-      const effective: AgentConfig = {
+      const effective: AgentConfig = withModelRoute({
         ...bestAgent,
         provider: bestAgent.provider ?? this.config.defaultProvider,
         baseURL: bestAgent.baseURL ?? this.config.defaultBaseURL,
         apiKey: bestAgent.apiKey ?? this.config.defaultApiKey,
         cwd: bestAgent.cwd === undefined ? this.config.defaultCwd : bestAgent.cwd,
         maxTokenBudget: effectiveBudget,
-      }
+      }, routeMatches(options?.modelRouting, { phase: 'short-circuit', agent: bestAgent.name }))
       const agent = buildAgent(effective)
 
       this.config.onProgress?.({
@@ -1506,7 +1606,7 @@ export class OpenMultiAgent {
     // ------------------------------------------------------------------
     // Step 1: Coordinator decomposes goal into tasks
     // ------------------------------------------------------------------
-    const coordinatorConfig: AgentConfig = {
+    const coordinatorBaseConfig: AgentConfig = {
       name: 'coordinator',
       model: coordinatorOverrides?.model ?? this.config.defaultModel,
       ...(coordinatorOverrides?.adapter !== undefined ? { adapter: coordinatorOverrides.adapter } : {}),
@@ -1533,6 +1633,10 @@ export class OpenMultiAgent {
       loopDetection: coordinatorOverrides?.loopDetection,
       timeoutMs: coordinatorOverrides?.timeoutMs,
     }
+    const coordinatorConfig = withModelRoute(
+      coordinatorBaseConfig,
+      routeMatches(options?.modelRouting, { phase: 'coordinator', agent: 'coordinator' }),
+    )
 
     const decompositionPrompt = this.buildDecompositionPrompt(goal, agentConfigs)
     const coordinatorAgent = buildAgent(coordinatorConfig)
@@ -1625,6 +1729,9 @@ export class OpenMultiAgent {
             },
           }
         : {}),
+      modelRouting: options?.modelRouting,
+      taskById: new Map(queue.list().map((task) => [task.id, task])),
+      taskLeafById: new Map(queue.list().map((task) => [task.id, isLeafTask(task, queue.list())])),
     }
 
     const planTasks = queue.list()
@@ -1708,10 +1815,14 @@ export class OpenMultiAgent {
       return this.buildTeamRunResult(agentResults, goal, taskRecords)
     }
     const synthesisPrompt = await this.buildSynthesisPrompt(goal, queue.list(), team)
+    const synthesisAgent = buildAgent(withModelRoute(
+      coordinatorBaseConfig,
+      routeMatches(options?.modelRouting, { phase: 'synthesis', agent: 'coordinator' }),
+    ))
     const synthTraceOptions: Partial<RunOptions> | undefined = this.config.onTrace
       ? { onTrace: this.config.onTrace, runId: runId ?? '', traceAgent: 'coordinator' }
       : undefined
-    const synthesisResult = await coordinatorAgent.run(synthesisPrompt, synthTraceOptions)
+    const synthesisResult = await synthesisAgent.run(synthesisPrompt, synthTraceOptions)
     agentResults.set('coordinator', synthesisResult)
     cumulativeUsage = addUsage(cumulativeUsage, synthesisResult.tokenUsage)
     if (
@@ -1829,9 +1940,11 @@ export class OpenMultiAgent {
       maxRetries?: number
       retryDelayMs?: number
       retryBackoff?: number
+      role?: string
+      priority?: 'low' | 'normal' | 'high' | 'critical'
       verify?: ConsensusVerifyOptions
     }>,
-    options?: { abortSignal?: AbortSignal },
+    options?: RunTasksOptions,
   ): Promise<TeamRunResult> {
     const agentConfigs = team.getAgents()
     const queue = new TaskQueue()
@@ -1846,6 +1959,8 @@ export class OpenMultiAgent {
         maxRetries: t.maxRetries,
         retryDelayMs: t.retryDelayMs,
         retryBackoff: t.retryBackoff,
+        role: t.role,
+        priority: t.priority,
         verify: t.verify,
       })),
       agentConfigs,
@@ -2167,7 +2282,7 @@ export class OpenMultiAgent {
   private async executeExplicitTaskQueue(
     team: Team,
     queue: TaskQueue,
-    options?: { abortSignal?: AbortSignal },
+    options?: RunTasksOptions,
     goal?: string,
   ): Promise<TeamRunResult> {
     const agentConfigs = team.getAgents()
@@ -2189,6 +2304,9 @@ export class OpenMultiAgent {
       budgetExceededTriggered: false,
       budgetExceededReason: undefined,
       taskMetrics: new Map<string, TaskExecutionMetrics>(),
+      modelRouting: options?.modelRouting,
+      taskById: new Map(queue.list().map((task) => [task.id, task])),
+      taskLeafById: new Map(queue.list().map((task) => [task.id, isLeafTask(task, queue.list())])),
     }
 
     await executeQueue(queue, ctx)
@@ -2222,6 +2340,8 @@ export class OpenMultiAgent {
       maxRetries?: number
       retryDelayMs?: number
       retryBackoff?: number
+      role?: string
+      priority?: 'low' | 'normal' | 'high' | 'critical'
     }>,
     agentConfigs: AgentConfig[],
     queue: TaskQueue,
@@ -2249,6 +2369,8 @@ export class OpenMultiAgent {
         maxRetries: spec.maxRetries,
         retryDelayMs: spec.retryDelayMs,
         retryBackoff: spec.retryBackoff,
+        role: spec.role,
+        priority: spec.priority,
         verify: spec.verify,
       })
       const titleKey = normalizeTitle(spec.title)
